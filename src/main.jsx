@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   CalendarDays, ChevronLeft, ChevronRight, RefreshCw, LogOut,
-  CheckCircle2, Circle, X, LockKeyhole, LoaderCircle, AlertCircle, Cloud,
+  CheckCircle2, Circle, X, LockKeyhole, AlertCircle, Cloud,
   Database, ArrowUpRight, UserRound, Tv, Sunrise, Cigarette,
   Sandwich, ShowerHead, Dumbbell, MessagesSquare
 } from 'lucide-react';
@@ -130,7 +130,6 @@ function App() {
   const [week, setWeek] = useState(startOfWeek(new Date()));
   const [now, setNow] = useState(new Date());
   const [calendarBusy, setCalendarBusy] = useState(false);
-  const [notionBusy, setNotionBusy] = useState(false);
   const [calendarError, setCalendarError] = useState('');
   const [notionError, setNotionError] = useState('');
   const [database, setDatabase] = useState(null);
@@ -138,14 +137,13 @@ function App() {
   const [health, setHealth] = useState(null);
 
   const loadNotion = useCallback(async () => {
-    setNotionBusy(true); setNotionError('');
+    setNotionError('');
     try {
       const [db, pageData] = await Promise.all([api('/api/notion/database'), api('/api/notion/pages')]);
       console.log('[Weekview] Notion database schema:', db.properties);
       console.log('[Weekview] Notion habit rows received:', pageData.results || []);
       setDatabase(db); setHabitRows(pageData.results || []);
     } catch (error) { setNotionError(error.message); }
-    finally { setNotionBusy(false); }
   }, []);
 
   const loadCalendars = useCallback(async () => {
@@ -318,14 +316,24 @@ function App() {
     const duration = Math.max(0.5,(clippedEnd-clippedStart)/3600000);
     return { top:`${top}px`, height:`${Math.max(22,duration*44-2)}px`, background:event.calendarColor || '#777' };
   };
-  const goWeek = delta => setWeek(new Date(week.getTime()+delta*7*DAY_MS));
+  const goWeek = delta => setWeek(current => new Date(current.getTime()+delta*7*DAY_MS));
+  const jumpRelative = (amount, unit) => setWeek(current => {
+    const target = new Date(current);
+    if (unit === 'week') target.setDate(target.getDate() + amount * 7);
+    if (unit === 'month') {
+      const dayOfMonth = target.getDate();
+      target.setDate(1);
+      target.setMonth(target.getMonth() + amount);
+      target.setDate(Math.min(dayOfMonth, new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate()));
+    }
+    if (unit === 'year') target.setFullYear(target.getFullYear() + amount);
+    return startOfWeek(target);
+  });
   const toggleCalendar = id => setSelected(old => old.includes(id) ? old.filter(x=>x!==id) : [...old,id]);
   const signOut = async () => {
     await api('/api/auth/logout',{method:'POST'});
     setAuth({checked:true,connected:false,email:null}); setEvents([]); setCalendars([]); setSelected([]);
   };
-  const habitMatched = habitProperties.filter(h=>h.propertyName).length;
-
   if (!auth.checked) return <div className="boot"><div className="boot-mark"><CalendarDays size={22}/></div><span>Opening Weekview…</span></div>;
 
   if (!auth.connected) return <div className="login-shell">
@@ -385,6 +393,10 @@ function App() {
           <div className="panel-heading">
             <div><p className="eyebrow">GOOGLE CALENDAR</p><h2>{formatRange(week)}</h2></div>
             <div className="calendar-controls">
+              <label className="calendar-jump-date"><span>Go to</span><input type="date" value={dateKey(week)} aria-label="Go to week containing date" onChange={event=>{if(event.target.value)setWeek(startOfWeek(new Date(`${event.target.value}T00:00:00`)));}}/></label>
+              <select className="calendar-jump-select" aria-label="Jump relative to this week" value="" onChange={event=>{const [amount,unit]=event.target.value.split(':');if(unit)jumpRelative(Number(amount),unit);}}>
+                <option value="">Jump…</option><option value="-1:week">−1 week</option><option value="-1:month">−1 month</option><option value="-1:year">−1 year</option><option value="1:week">+1 week</option><option value="1:month">+1 month</option><option value="1:year">+1 year</option>
+              </select>
               <button onClick={()=>setWeek(startOfWeek(new Date()))}>Today</button>
               <button className="arrow-control" aria-label="Previous week" onClick={()=>goWeek(-1)}><ChevronLeft size={16}/></button>
               <button className="arrow-control" aria-label="Next week" onClick={()=>goWeek(1)}><ChevronRight size={16}/></button>
@@ -410,11 +422,6 @@ function App() {
         </section>
 
         <section className="habits-panel">
-          <div className="habits-panel-heading">
-            <div><p className="eyebrow">NOTION · DAILY LOG</p><h2>Habits</h2></div>
-            <div className="habits-meta">{database ? `${formatRange(week)} · ${habitMatched}/8 habits matched` : 'Waiting for Notion'}</div>
-            <button className="refresh-habits" onClick={loadNotion} disabled={notionBusy}>{notionBusy?<LoaderCircle size={14} className="spin"/>:<RefreshCw size={14}/>} Refresh</button>
-          </div>
           {notionError && <div className="notion-error">{notionError}</div>}
           <div className="habits-table-scroll">
             <table className="habit-table">
@@ -432,7 +439,7 @@ function App() {
               </tbody>
             </table>
           </div>
-          {habitMatched<8 && database && <div className="mapping-note">Not matched in Notion: {habitProperties.filter(h=>!h.propertyName).map(h=>h.label).join(', ')}. Share the exact Notion column names and I’ll map them.</div>}
+          {database && habitProperties.some(h=>!h.propertyName) && <div className="mapping-note">Not matched in Notion: {habitProperties.filter(h=>!h.propertyName).map(h=>h.label).join(', ')}. Share the exact Notion column names and I’ll map them.</div>}
         </section>
       </section>
     </main>
