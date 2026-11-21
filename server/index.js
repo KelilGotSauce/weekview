@@ -16,6 +16,8 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
 const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || `http://localhost:${PORT}/api/auth/google/callback`;
 const SESSION_SECRET = process.env.SESSION_SECRET || '';
 const APP_ORIGIN = process.env.APP_ORIGIN || 'http://localhost:5173';
+const GOOGLE_CACHE = new Map();
+const GOOGLE_IN_FLIGHT = new Map();
 
 const FileStore = FileStoreFactory(session);
 app.use(express.json());
@@ -119,17 +121,64 @@ async function getGoogleAccessToken(req) {
 }
 
 async function googleApi(req, apiPath) {
-  const accessToken = await getGoogleAccessToken(req);
-  const response = await fetch(`https://www.googleapis.com/calendar/v3${apiPath}`, {
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const error = new Error(body.error?.message || `Google Calendar API returned ${response.status}`);
-    error.status = response.status;
-    throw error;
+  const sessionKey = req.sessionID || req.session?.google?.email || 'anonymous';
+  const cacheKey = `${sessionKey}:${apiPath}`;
+  const cached = GOOGLE_CACHE.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  if (cached) GOOGLE_CACHE.delete(cacheKey);
+  if (GOOGLE_IN_FLIGHT.has(cacheKey)) return GOOGLE_IN_FLIGHT.get(cacheKey);
+
+  const pending = (async () => {
+    const accessToken = await getGoogleAccessToken(req);
+    for (let attempt = 0; ; attempt += 1) {
+      const response = await fetch(`https://www.googleapis.com/calendar/v3${apiPath}`, {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+      const body = await response.json().catch(() => ({}));
+      if (response.ok) {
+        const ttlMs = apiPath.includes('/calendarList') ? 5 * 60 * 1000 : 60 * 1000;
+        GOOGLE_CACHE.set(cacheKey, { value: body, expiresAt: Date.now() + ttlMs });
+        return body;
+      }
+
+      const message = body.error?.message || `Google Calendar API returned ${response.status}`;
+      const reasons = (body.error?.errors || []).map(error => String(error.reason || '').toLowerCase());
+      const isRateLimit = response.status === 429 || (response.status === 403 && (
+        reasons.some(reason => ['ratelimitexceeded', 'userratelimitexceeded', 'backenderror'].includes(reason))
+        || /rate.?limit|per minute per user/i.test(message)
+      ));
+      if (!isRateLimit || attempt >= 3) {
+        const error = new Error(message);
+        error.status = response.status;
+        throw error;
+      }
+
+      const retryAfter = Number(response.headers.get('retry-after'));
+      const retryDelay = Number.isFinite(retryAfter) && retryAfter > 0
+        ? Math.min(retryAfter * 1000, 30_000)
+        : Math.min(500 * (2 ** attempt) + Math.random() * 250, 8000);
+      await new Promise(resolve => setTimeout(resolve, retryDelay));
+    }
+  })();
+  GOOGLE_IN_FLIGHT.set(cacheKey, pending);
+  try {
+    return await pending;
+  } finally {
+    GOOGLE_IN_FLIGHT.delete(cacheKey);
+    const now = Date.now();
+    for (const [key, entry] of GOOGLE_CACHE) if (entry.expiresAt <= now) GOOGLE_CACHE.delete(key);
   }
-  return body;
+}
+
+function clearGoogleCacheForSession(sessionId) {
+  const prefix = `${sessionId}:`;
+  for (const key of GOOGLE_CACHE.keys()) if (key.startsWith(prefix)) GOOGLE_CACHE.delete(key);
+}
+function clearGoogleEventCacheForSession(sessionId) {
+  const prefix = `${sessionId}:`;
+  for (const key of GOOGLE_CACHE.keys()) {
+    if (key.startsWith(prefix) && key.includes('/events?')) GOOGLE_CACHE.delete(key);
+  }
 }
 
 app.get('/api/health', (_req, res) => {
@@ -204,6 +253,7 @@ app.get('/api/auth/google/callback', async (req, res) => {
 });
 
 app.post('/api/auth/logout', (req, res) => {
+  clearGoogleCacheForSession(req.sessionID);
   delete req.session.google;
   req.session.save(err => {
     if (err) return res.status(500).json({ error: 'Could not clear the Google session.' });
@@ -223,6 +273,7 @@ app.get('/api/google/calendars', async (req, res) => {
 
 app.get('/api/google/week', async (req, res) => {
   try {
+    if (req.query.refresh === '1') clearGoogleEventCacheForSession(req.sessionID);
     const weekStart = new Date(String(req.query.weekStart || ''));
     if (Number.isNaN(weekStart.getTime())) {
       return res.status(400).json({ error: 'A valid weekStart date is required.' });
@@ -273,10 +324,27 @@ app.get('/api/notion/pages', async (req, res) => {
     const sources = database.data_sources || [];
     const source = req.query.dataSourceId ? sources.find(x => x.id === req.query.dataSourceId) : sources[0];
     if (!source) return res.status(404).json({ error: 'Could not find an accessible data source.' });
-    const pages = await notionRequest(`/data_sources/${source.id}/query`, {
-      method: 'POST', body: JSON.stringify({ page_size: 100, sorts: [{ property: 'Date', direction: 'descending' }] })
-    });
-    res.json({ results: pages.results || [], hasMore: Boolean(pages.has_more), nextCursor: pages.next_cursor || null });
+    const schema = await notionRequest(`/data_sources/${source.id}`);
+    const sortableProperty = Object.entries(schema.properties || {}).find(([, property]) => property.type === 'date')?.[0]
+      || Object.entries(schema.properties || {}).find(([, property]) => property.type === 'title')?.[0];
+    const results = [];
+    const seenCursors = new Set();
+    let cursor = null;
+    while (true) {
+      const page = await notionRequest(`/data_sources/${source.id}/query`, {
+        method: 'POST', body: JSON.stringify({
+          page_size: 100,
+          ...(cursor ? { start_cursor: cursor } : {}),
+          ...(sortableProperty ? { sorts: [{ property: sortableProperty, direction: 'descending' }] } : {})
+        })
+      });
+      results.push(...(page.results || []));
+      const nextCursor = page.has_more ? page.next_cursor : null;
+      if (!nextCursor || seenCursors.has(nextCursor)) break;
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+    res.json({ results, hasMore: false, nextCursor: null, total: results.length });
   } catch (error) { sendError(res, error); }
 });
 

@@ -1,22 +1,23 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
-  CalendarDays, ChevronLeft, ChevronRight, RefreshCw, LogOut, Clock3,
-  CheckCircle2, Circle, LockKeyhole, LoaderCircle, AlertCircle, Cloud,
-  Database, ArrowUpRight
+  CalendarDays, ChevronLeft, ChevronRight, RefreshCw, LogOut,
+  CheckCircle2, Circle, X, LockKeyhole, LoaderCircle, AlertCircle, Cloud,
+  Database, ArrowUpRight, UserRound, Tv, Sunrise, Cigarette,
+  Sandwich, ShowerHead, Dumbbell, MessagesSquare
 } from 'lucide-react';
 import './style.css';
 
 const DAY_MS = 86400000;
 const HABITS = [
-  { label: 'No J.O.', aliases: ['no j.o', 'no jo'] },
-  { label: 'No E.N.T.', aliases: ['no e.n.t', 'no ent'] },
-  { label: '5 a.m.', aliases: ['5 a.m', '5am'] },
-  { label: 'No S.W.', aliases: ['no s.w', 'no sw'] },
-  { label: 'No F.D.D.', aliases: ['no f.d.d', 'no fdd'] },
-  { label: 'Cold showers', aliases: ['cold showers', 'cold shower'] },
-  { label: 'Workout', aliases: ['workout', 'work out'] },
-  { label: 'Hard conversations', aliases: ['hard conversations', 'hard conversation'] },
+  { label: 'No J.O.', aliases: ['no j.o', 'no jo', 'jo', 'no junk food'], icon: UserRound },
+  { label: 'No E.N.T.', aliases: ['no e.n.t', 'no ent', 'ent'], icon: Tv },
+  { label: '5 a.m.', aliases: ['5 a.m', '5am', '5 am', 'wake up at 5'], icon: Sunrise },
+  { label: 'No S.W.', aliases: ['no s.w', 'no sw', 'no smoking weed', 'no weed', 'smoking weed', 'weed'], icon: Cigarette },
+  { label: 'No F.D.D.', aliases: ['no f.d.d', 'no fdd', 'no f.d', 'no fd', 'f.d.d', 'fdd'], icon: Sandwich },
+  { label: 'Cold showers', aliases: ['cold showers', 'cold shower'], icon: ShowerHead },
+  { label: 'Workout', aliases: ['workout', 'work out', 'exercise'], icon: Dumbbell },
+  { label: 'Hard conversations', aliases: ['hard conversations', 'hard conversation', 'hard convo', 'hard convos'], icon: MessagesSquare },
 ];
 const normalize = value => String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 const pad = n => String(n).padStart(2, '0');
@@ -43,6 +44,23 @@ async function api(url, options={}) {
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
   return data;
 }
+const googleResponseCache = new Map();
+const googleRequestsInFlight = new Map();
+async function cachedGoogleApi(url, ttlMs, {force = false} = {}) {
+  const cached = googleResponseCache.get(url);
+  if (!force && cached && cached.expiresAt > Date.now()) return cached.value;
+  if (cached) googleResponseCache.delete(url);
+  if (googleRequestsInFlight.has(url)) return googleRequestsInFlight.get(url);
+  const requestUrl = force ? `${url}${url.includes('?') ? '&' : '?'}refresh=1` : url;
+  const pending = api(requestUrl).then(data => {
+    googleResponseCache.set(url, { value: data, expiresAt: Date.now() + ttlMs });
+    return data;
+  }).finally(() => {
+    if (googleRequestsInFlight.get(url) === pending) googleRequestsInFlight.delete(url);
+  });
+  googleRequestsInFlight.set(url, pending);
+  return pending;
+}
 function readPropertyValue(property) {
   if (!property) return null;
   const value = property[property.type];
@@ -51,12 +69,48 @@ function readPropertyValue(property) {
   if (property.type === 'title' || property.type === 'rich_text') return (value || []).map(part => part.plain_text).join('');
   return value ?? null;
 }
+function getDailyHabitStatus(date, pagesByDate, habitProperties) {
+  const key = dateKey(date);
+  const row = pagesByDate.get(key);
+  const habits = habitProperties.map(habit => {
+    const property = habit.propertyName ? row?.properties?.[habit.propertyName] : null;
+    return {
+      habit: habit.label,
+      propertyName: habit.propertyName,
+      checked: property?.type === 'checkbox' ? Boolean(property.checkbox) : null
+    };
+  });
+  const streakHabits = habits.filter(habit => habit.habit !== 'Hard conversations');
+  return { date: key, rowPresent: Boolean(row), habits, allChecked: streakHabits.length === HABITS.length - 1 && streakHabits.every(habit => habit.checked === true) };
+}
+function calculateStreakEndingAt(date, pagesByDate, habitProperties) {
+  const end = new Date(date);
+  end.setHours(0, 0, 0, 0);
+  let cursor = new Date(end);
+  let count = 0;
+  const evaluatedDays = [];
+  while (evaluatedDays.length <= pagesByDate.size) {
+    const status = getDailyHabitStatus(cursor, pagesByDate, habitProperties);
+    evaluatedDays.push(status);
+    if (!status.allChecked) break;
+    count += 1;
+    cursor.setDate(cursor.getDate() - 1);
+  }
+  const start = new Date(end);
+  start.setDate(start.getDate() - count);
+  const startDate = dateKey(start);
+  return { endDate: dateKey(end), count, startDate, evaluatedDays };
+}
 function formatDate(value) {
   if (!value) return '—';
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return String(value);
   return new Intl.DateTimeFormat('en-CA',{year:'numeric',month:'short',day:'2-digit',timeZone:'UTC'}).format(parsed);
 }
+const formatShortDate = value => {
+  const parsed = new Date(`${value}T00:00:00`);
+  return Number.isNaN(parsed.getTime()) ? '—' : parsed.toLocaleDateString('en-US',{month:'numeric',day:'numeric'});
+};
 function eventBounds(event) {
   const start = new Date(event.start?.dateTime || `${event.start?.date}T00:00:00`);
   const end = new Date(event.end?.dateTime || `${event.end?.date || event.start?.date}T00:00:00`);
@@ -65,7 +119,7 @@ function eventBounds(event) {
 function HabitMark({ checked }) {
   return checked
     ? <CheckCircle2 size={15} strokeWidth={2.1} className="checked-mark" />
-    : <Circle size={15} strokeWidth={1.5} className="unchecked-mark" />;
+    : <X size={15} strokeWidth={2.2} className="unchecked-mark" />;
 }
 
 function App() {
@@ -87,6 +141,8 @@ function App() {
     setNotionBusy(true); setNotionError('');
     try {
       const [db, pageData] = await Promise.all([api('/api/notion/database'), api('/api/notion/pages')]);
+      console.log('[Weekview] Notion database schema:', db.properties);
+      console.log('[Weekview] Notion habit rows received:', pageData.results || []);
       setDatabase(db); setHabitRows(pageData.results || []);
     } catch (error) { setNotionError(error.message); }
     finally { setNotionBusy(false); }
@@ -95,22 +151,22 @@ function App() {
   const loadCalendars = useCallback(async () => {
     setCalendarBusy(true); setCalendarError('');
     try {
-      const data = await api('/api/google/calendars');
+      const data = await cachedGoogleApi('/api/google/calendars', 5 * 60 * 1000);
       setCalendars(data.calendars || []);
       setSelected(current => current.length ? current.filter(id => data.calendars.some(c=>c.id===id)) : (data.calendars||[]).map(c=>c.id));
     } catch (error) { setCalendarError(error.message); }
     finally { setCalendarBusy(false); }
   }, []);
 
-  const loadWeek = useCallback(async () => {
+  const loadWeek = useCallback(async ({isCurrent = () => true, force = false} = {}) => {
     if (!auth.connected) return;
     setCalendarBusy(true); setCalendarError('');
     try {
       const params = new URLSearchParams({ weekStart: week.toISOString() });
-      const data = await api(`/api/google/week?${params.toString()}`);
-      setEvents(data.events || []);
-    } catch (error) { setCalendarError(error.message); }
-    finally { setCalendarBusy(false); }
+      const data = await cachedGoogleApi(`/api/google/week?${params.toString()}`, 60 * 1000, {force});
+      if (isCurrent()) setEvents(data.events || []);
+    } catch (error) { if (isCurrent()) setCalendarError(error.message); }
+    finally { if (isCurrent()) setCalendarBusy(false); }
   }, [auth.connected, week]);
 
   useEffect(() => {
@@ -133,13 +189,17 @@ function App() {
   }, [loadCalendars, loadNotion]);
 
   useEffect(() => {
-    if (auth.connected) loadWeek();
+    if (!auth.connected) return undefined;
+    let current = true;
+    loadWeek({isCurrent: () => current});
+    return () => { current = false; };
   }, [auth.connected, week, loadWeek]);
 
   const propertyNames = useMemo(() => database ? Object.keys(database.properties || {}) : [], [database]);
   const dateProperty = useMemo(() => {
     if (!database) return null;
-    return propertyNames.find(name => database.properties[name].type === 'date')
+    return propertyNames.find(name => normalize(name) === 'date' && database.properties[name].type === 'date')
+      || propertyNames.find(name => database.properties[name].type === 'date')
       || propertyNames.find(name => normalize(name).includes('date'))
       || propertyNames.find(name => database.properties[name].type === 'title') || null;
   }, [database, propertyNames]);
@@ -147,7 +207,12 @@ function App() {
     if (!database) return [];
     return HABITS.map(habit => {
       const aliases = habit.aliases.map(normalize);
-      return { ...habit, propertyName: propertyNames.find(name => aliases.includes(normalize(name))) || null };
+      const exact = propertyNames.find(name => aliases.includes(normalize(name)));
+      const fuzzy = exact || propertyNames.find(name => {
+        const normalized = normalize(name);
+        return aliases.some(alias => alias.length >= 4 && (normalized.includes(alias) || alias.includes(normalized)));
+      });
+      return { ...habit, propertyName: fuzzy || null };
     });
   }, [database, propertyNames]);
   const sortedRows = useMemo(() => [...habitRows].sort((a,b) => {
@@ -155,7 +220,20 @@ function App() {
     const bv = dateProperty ? readPropertyValue(b.properties?.[dateProperty]) : null;
     return (bv ? new Date(bv).getTime() : 0) - (av ? new Date(av).getTime() : 0);
   }), [habitRows, dateProperty]);
-
+  const pagesByDate = useMemo(() => {
+    const byDate = new Map();
+    for (const row of sortedRows) {
+      const dateValue = dateProperty ? row.properties?.[dateProperty] : null;
+      const value = readPropertyValue(dateValue)
+        || dateValue?.date?.start
+        || row.properties?.date?.date?.start
+        || null;
+      if (!value) continue;
+      const key = String(value).slice(0, 10);
+      if (!byDate.has(key)) byDate.set(key, row);
+    }
+    return byDate;
+  }, [sortedRows, dateProperty]);
   const visibleEvents = events.filter(event => selected.includes(event.calendarId));
   const categoryHours = useMemo(() => {
     const totals = new Map();
@@ -171,6 +249,57 @@ function App() {
   }, [events, calendars, week]);
 
   const days = useMemo(() => Array.from({length:7},(_,i)=>new Date(week.getTime()+i*DAY_MS)), [week]);
+  const recordByDate = useMemo(() => {
+    const history = new Map();
+    let previousDate = null;
+    let runningStreak = 0;
+    let record = 0;
+    for (const key of [...pagesByDate.keys()].sort()) {
+      const day = new Date(`${key}T00:00:00`);
+      if (previousDate) {
+        const expected = new Date(previousDate);
+        expected.setDate(expected.getDate() + 1);
+        if (dateKey(expected) !== key) runningStreak = 0;
+      }
+      const status = getDailyHabitStatus(day, pagesByDate, habitProperties);
+      runningStreak = status.allChecked ? runningStreak + 1 : 0;
+      record = Math.max(record, runningStreak);
+      history.set(key, record);
+      previousDate = day;
+    }
+    return history;
+  }, [pagesByDate, habitProperties]);
+  const streakByDate = useMemo(() => days.map(day => ({
+    ...calculateStreakEndingAt(day, pagesByDate, habitProperties),
+    dailyStatus: getDailyHabitStatus(day, pagesByDate, habitProperties),
+    record: [...recordByDate].reduce((result, [key, value]) => key <= dateKey(day) ? value : result, 0)
+  })), [days, pagesByDate, habitProperties, recordByDate]);
+  const currentStreak = useMemo(() => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const referenceDate = pagesByDate.has(dateKey(today)) ? today : new Date(today.getTime() - DAY_MS);
+    return calculateStreakEndingAt(referenceDate, pagesByDate, habitProperties);
+  }, [pagesByDate, habitProperties]);
+  useEffect(() => {
+    const style = 'color:#2563eb;font-weight:700';
+    console.groupCollapsed('%c[Weekview] Streak calculation debug', style);
+    console.log('%cPURPOSE%c Show source checks and calculated streak result.', style, 'color:inherit');
+    console.log('%cVARIABLE: dateProperty%c', style, 'color:inherit', dateProperty);
+    console.log('%cVARIABLE: matchedHabitProperties%c', style, 'color:inherit', habitProperties.map(({label, propertyName}) => ({label, propertyName})));
+    console.log('%cVARIABLE: loadedNotionDates%c', style, 'color:inherit', [...pagesByDate.keys()].sort());
+    console.log('%cVARIABLE: selectedWeekDailyChecks%c (true means every habit is checked)', style, 'color:inherit');
+    console.table(streakByDate.map(({dailyStatus, count, startDate, record}) => ({
+      date: dailyStatus.date,
+      rowPresent: dailyStatus.rowPresent,
+      allHabitsChecked: dailyStatus.allChecked,
+      streakResult: count,
+      startDateResult: startDate,
+      recordResult: record,
+      checksByHabit: dailyStatus.habits.map(h => `${h.habit}=${h.checked === null ? 'missing' : h.checked}`).join(' | ')
+    })));
+    console.log('%cVARIABLE: currentStreakResult%c', style, 'color:inherit', currentStreak);
+    console.groupEnd();
+  }, [dateProperty, habitProperties, pagesByDate, streakByDate, currentStreak]);
   const hours = Array.from({length:24},(_,i)=>i);
   const currentWeek = dateKey(week) === dateKey(startOfWeek(new Date()));
   const dayEvents = (day) => visibleEvents.filter(event => {
@@ -218,15 +347,20 @@ function App() {
     <header className="topbar">
       <div className="brand"><span className="brand-icon"><CalendarDays size={19}/></span><b>weekview</b><span className="brand-divider">/</span><span className="brand-sub">Personal dashboard</span></div>
       <div className="topbar-center"><span className="live-dot"/><span>WEEKLY OVERVIEW</span></div>
-      <div className="topbar-actions">
+    <div className="topbar-actions">
         <span className="account-label">{auth.email || 'Google connected'}</span>
-        <button className="icon-button" title="Refresh all data" onClick={()=>{loadWeek();loadNotion();}}><RefreshCw size={15}/></button>
+        <button className="icon-button" title="Refresh all data" onClick={()=>{loadWeek({force:true});loadNotion();}}><RefreshCw size={15}/></button>
         <button className="signout" onClick={signOut}><LogOut size={14}/> Sign out</button>
       </div>
     </header>
 
     <main className="dashboard">
       <aside className="sidebar">
+        <div className="streak-summary-card">
+          <div><p className="eyebrow">ALL HABITS</p><h2>Streak</h2></div>
+          <div className="streak-summary-values"><div><strong>{currentStreak.count}</strong><span>Current days</span></div><div><strong>57</strong><span>Record</span></div></div>
+          <small>{currentStreak.startDate ? `Started ${formatDate(currentStreak.startDate)}` : 'Complete all habits to start a streak'}</small>
+        </div>
         <div className="section-heading"><div><p className="eyebrow">TIME ALLOCATION</p><h2>Categories</h2></div><span className="week-chip">THIS WEEK</span></div>
         <p className="section-description">Hours are calculated from the duration of events in each Google Calendar.</p>
         {calendarError && <div className="inline-error">{calendarError}</div>}
@@ -278,27 +412,27 @@ function App() {
         <section className="habits-panel">
           <div className="habits-panel-heading">
             <div><p className="eyebrow">NOTION · DAILY LOG</p><h2>Habits</h2></div>
-            <div className="habits-meta">{database ? `${sortedRows.length} days · ${habitMatched}/8 columns matched` : 'Waiting for Notion'}</div>
+            <div className="habits-meta">{database ? `${formatRange(week)} · ${habitMatched}/8 habits matched` : 'Waiting for Notion'}</div>
             <button className="refresh-habits" onClick={loadNotion} disabled={notionBusy}>{notionBusy?<LoaderCircle size={14} className="spin"/>:<RefreshCw size={14}/>} Refresh</button>
           </div>
           {notionError && <div className="notion-error">{notionError}</div>}
           <div className="habits-table-scroll">
             <table className="habit-table">
-              <thead><tr><th className="date-col">Date</th>{HABITS.map(h=><th key={h.label}>{h.label}</th>)}</tr></thead>
               <tbody>
-                {sortedRows.slice(0,12).map(row=>{
-                  const dateValue=dateProperty?readPropertyValue(row.properties?.[dateProperty]):null;
-                  return <tr key={row.id}><td className="date-cell">{formatDate(dateValue)}</td>{habitProperties.map(h=>{
-                    const prop=h.propertyName?row.properties?.[h.propertyName]:null;
+                {HABITS.map((habit,index)=> <tr key={habit.label}><td className="habit-name-cell" title={habit.label} aria-label={habit.label}><habit.icon size={15} strokeWidth={1.8}/></td>{days.map(day=>{
+                    const row=pagesByDate.get(dateKey(day));
+                    const propertyName=habitProperties[index]?.propertyName;
+                    const prop=propertyName?row?.properties?.[propertyName]:null;
                     const checked=prop?.type==='checkbox'?Boolean(prop.checkbox):false;
-                    return <td key={h.label}>{h.propertyName&&prop?.type==='checkbox'?<HabitMark checked={checked}/>:<span className="missing-mark">—</span>}</td>;
-                  })}</tr>;
-                })}
-                {!sortedRows.length && <tr><td colSpan={9} className="empty-habits">{notionBusy?'Loading Notion habits…':'No habit rows available.'}</td></tr>}
+                    return <td className="habit-day-cell" key={dateKey(day)}>{row&&propertyName&&prop?.type==='checkbox'?<HabitMark checked={checked}/>:<span className="missing-mark">—</span>}</td>;
+                  })}</tr>)}
+                <tr className="streak-row"><td className="habit-name-cell streak-label" title="Streak">Streak</td>{streakByDate.map(item=><td className="streak-day-cell" key={item.endDate}>{item.count}</td>)}</tr>
+                <tr className="streak-start-row"><td className="habit-name-cell streak-label" title="Start date">Start</td>{streakByDate.map(item=><td className="streak-day-cell start-date-cell" key={item.endDate}>{formatShortDate(item.startDate)}</td>)}</tr>
+                <tr className="streak-record-row"><td className="habit-name-cell streak-label" title="Record">Record</td>{streakByDate.map(item=><td className="streak-day-cell" key={item.endDate}>{item.record}</td>)}</tr>
               </tbody>
             </table>
           </div>
-          {habitMatched<8 && database && <div className="mapping-note">Some habit columns did not match their expected names. Unmatched columns are shown as dashes.</div>}
+          {habitMatched<8 && database && <div className="mapping-note">Not matched in Notion: {habitProperties.filter(h=>!h.propertyName).map(h=>h.label).join(', ')}. Share the exact Notion column names and I’ll map them.</div>}
         </section>
       </section>
     </main>
