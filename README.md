@@ -6,6 +6,8 @@ This project combines the original read-only Google Calendar week view with the 
 - Left 30%: Google Calendar categories with total scheduled hours for the selected week.
 - Right upper 75%: weekly Google Calendar view.
 - Right lower 25%: Notion date + eight selected checkbox habits.
+- Finance tab: 2026 Notion transactions, asset and credit inputs, monthly summaries, and registered-account progress.
+- Network tab: editable people and organization graph, relationship paths, and direct connection-strength ratings.
 - Google Calendar access is read-only. Notion access is read-only.
 
 ## Requirements
@@ -26,7 +28,13 @@ GOOGLE_REDIRECT_URI=http://localhost:8787/api/auth/google/callback
 APP_ORIGIN=http://localhost:5173
 SESSION_SECRET=a_long_random_secret
 PORT=8787
+MONGODB_URI=your_private_mongodb_atlas_connection_uri
+MONGODB_DATABASE=weekview
 ```
+
+Finance balances, credit inputs, credit score, registered-account contribution inputs, transaction Expense 2 overrides, and annual expense budgets are saved in MongoDB Atlas. Add the Atlas URI to your private local `.env` file; do not paste it into chat or commit it. The server stores these values in the `finance_settings` collection in the configured database. If MongoDB is not configured, finance data from Notion remains viewable, but manual finance inputs cannot be saved.
+
+The Network tab stores its graph separately in the `network_graphs` collection in the same Atlas database. It can show several directed routes from you to a target; mark a route as a potential lead when it is not confirmed.
 
 The existing browser-only Google project used `VITE_GOOGLE_CLIENT_ID`. You can reuse the same OAuth client ID, but the new server-side flow also requires that OAuth client's **client secret**. The server supports `VITE_GOOGLE_CLIENT_ID` as a fallback for the client ID, but do not put the client secret in a `VITE_` variable.
 
