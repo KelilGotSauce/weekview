@@ -5,6 +5,7 @@ import FileStoreFactory from 'session-file-store';
 import { MongoClient } from 'mongodb';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { NETWORK_EXPANSION } from './network-expansion.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -62,11 +63,12 @@ function notionConfigured() {
 }
 
 const FINANCE_INPUT_KEYS = new Set([
-  ...['checking','stocks','bitcoin','ethereum','solana','inventory','owed','giftCards','taxes'].map(key => `asset:${key}`),
+  ...['checking','stocks','bitcoin','ethereum','solana','inventory','owed','giftCards','savings','taxes'].map(key => `asset:${key}`),
   ...['rbcMastercard','rbcCardTwo','amex','rbcLoc'].map(key => `credit:${key}`),
   'creditScore',
   ...['TFSA','FHSA','RRSP'].flatMap(account => [`limit:${account}`, `contribution:${account}`])
 ]);
+const NETWORK_ROLES = new Set(['artist','producer','executive','manager','media','organization','other']);
 const DEFAULT_NETWORK_GRAPH = {
   nodes: [
     { id:'you', name:'You', type:'person', strength:5 },
@@ -118,6 +120,20 @@ const DEFAULT_NETWORK_GRAPH = {
 };
 for (const node of DEFAULT_NETWORK_GRAPH.nodes) if (node.id !== 'you') node.strength = null;
 
+const NETWORK_SEED_VERSION = 1;
+function mergeNetworkSeed(graph, seed) {
+  const nodes = new Map(graph.nodes.map(node => [node.id, { ...node }]));
+  for (const node of seed.nodes) {
+    const existing = nodes.get(node.id);
+    nodes.set(node.id, existing
+      ? { ...node, ...existing, role: existing.role && existing.role !== 'other' ? existing.role : node.role }
+      : { ...node });
+  }
+  const edges = new Map(graph.edges.map(edge => [edge.id, edge]));
+  for (const edge of seed.edges) if (!edges.has(edge.id)) edges.set(edge.id, edge);
+  return { nodes: [...nodes.values()], edges: [...edges.values()] };
+}
+
 function validateNetworkGraph(value) {
   if (!value || !Array.isArray(value.nodes) || !Array.isArray(value.edges) || value.nodes.length > 500 || value.edges.length > 1200) {
     const error = new Error('Network graph must contain at most 500 nodes and 1,200 relationships.');
@@ -128,6 +144,16 @@ function validateNetworkGraph(value) {
     id: String(node.id || '').slice(0, 100),
     name: String(node.name || '').trim().slice(0, 120),
     type: node.type === 'organization' ? 'organization' : 'person',
+    role: NETWORK_ROLES.has(node.role) ? node.role : (node.type === 'organization' ? 'organization' : 'other'),
+    city: String(node.city || '').trim().slice(0, 100),
+    instagram: String(node.instagram || '').trim().slice(0, 240),
+    email: String(node.email || '').trim().slice(0, 254),
+    phone: String(node.phone || '').trim().slice(0, 60),
+    imageUrl: (() => {
+      const imageUrl=String(node.imageUrl||'').trim().slice(0,1000);
+      try { const parsed=new URL(imageUrl); return parsed.protocol==='https:'?parsed.href:''; }
+      catch { return ''; }
+    })(),
     strength: node.strength === null || node.strength === undefined || node.strength === ''
       ? null
       : Math.min(5, Math.max(1, Math.round(Number(node.strength) || 1)))
@@ -223,7 +249,16 @@ app.get('/api/finance/inputs', async (_req, res) => {
   try {
     const collection = await financeCollection();
     const saved = await collection.findOne({ _id: 'personal-finance-2026' }, { projection: { inputs: 1 } });
-    res.json({ inputs: saved?.inputs || {}, configured: true });
+    const inputs = { ...(saved?.inputs || {}) };
+    if (inputs['asset:savings'] === undefined) {
+      inputs['asset:savings'] = '25';
+      await collection.updateOne(
+        { _id: 'personal-finance-2026' },
+        { $set: { inputs, updatedAt: new Date() } },
+        { upsert: true }
+      );
+    }
+    res.json({ inputs, configured: true });
   } catch (error) { sendError(res, error); }
 });
 
@@ -246,7 +281,7 @@ function validateFinanceAnnotations(value) {
     error.status = 400;
     throw error;
   }
-  for (const key of ['expenseCategories','expenseBudgets']) {
+  for (const key of ['expenseCategories','expenseBudgets','expenseBudgetsByYear','assetAccounts']) {
     if (value[key] !== undefined && (!value[key] || typeof value[key] !== 'object' || Array.isArray(value[key]))) {
       const error = new Error(`${key} must be an object.`);
       error.status = 400;
@@ -255,30 +290,61 @@ function validateFinanceAnnotations(value) {
   }
   const expenseCategories = {};
   const expenseBudgets = {};
+  const expenseBudgetsByYear = {};
+  const assetAccounts = {};
+  const assetKeys = new Set(['checking','stocks','bitcoin','ethereum','solana','inventory','owed','giftCards','savings']);
+  const cleanBudgetMap = source => {
+    const budgets = {};
+    for (const [categoryValue, amountValue] of Object.entries(source || {}).slice(0, 500)) {
+      const category = String(categoryValue).trim().slice(0, 120);
+      if (!category) continue;
+      if (amountValue === '' || amountValue === null) { budgets[category] = ''; continue; }
+      const amount = Number(amountValue);
+      if (!Number.isFinite(amount) || amount < 0) {
+        const error = new Error(`Invalid annual budget for ${category}.`);
+        error.status = 400;
+        throw error;
+      }
+      budgets[category] = String(amount);
+    }
+    return budgets;
+  };
   for (const [pageId, categoryValue] of Object.entries(value.expenseCategories || {}).slice(0, 5000)) {
     if (!/^[a-zA-Z0-9-]{1,100}$/.test(pageId)) continue;
     expenseCategories[pageId] = String(categoryValue ?? '').trim().slice(0, 120);
   }
-  for (const [categoryValue, amountValue] of Object.entries(value.expenseBudgets || {}).slice(0, 500)) {
-    const category = String(categoryValue).trim().slice(0, 120);
-    if (!category) continue;
-    if (amountValue === '' || amountValue === null) { expenseBudgets[category] = ''; continue; }
-    const amount = Number(amountValue);
-    if (!Number.isFinite(amount) || amount < 0) {
-      const error = new Error(`Invalid annual budget for ${category}.`);
-      error.status = 400;
-      throw error;
-    }
-    expenseBudgets[category] = String(amount);
+  Object.assign(expenseBudgets, cleanBudgetMap(value.expenseBudgets));
+  for (const [yearValue, budgetValues] of Object.entries(value.expenseBudgetsByYear || {}).slice(0, 10)) {
+    if (!/^20\d{2}$/.test(yearValue) || Number(yearValue) < 2022 || Number(yearValue) > 2026) continue;
+    if (!budgetValues || typeof budgetValues !== 'object' || Array.isArray(budgetValues)) continue;
+    expenseBudgetsByYear[yearValue] = cleanBudgetMap(budgetValues);
   }
-  return { expenseCategories, expenseBudgets };
+  for (const [assetKey, accountsValue] of Object.entries(value.assetAccounts || {}).slice(0, 20)) {
+    if (!assetKeys.has(assetKey) || !accountsValue || typeof accountsValue !== 'object' || Array.isArray(accountsValue)) continue;
+    const accounts = {};
+    for (const [accountValue, amountValue] of Object.entries(accountsValue).slice(0, 100)) {
+      const account = String(accountValue).trim().slice(0, 100);
+      if (!account) continue;
+      if (amountValue === '' || amountValue === null) { accounts[account] = ''; continue; }
+      const amount = Number(amountValue);
+      if (!Number.isFinite(amount) || amount < 0) {
+        const error = new Error(`Invalid balance for ${account}.`);
+        error.status = 400;
+        throw error;
+      }
+      accounts[account] = String(amount);
+    }
+    assetAccounts[assetKey] = accounts;
+  }
+  const taxFormula = String(value.taxFormula ?? 'income * 0.25').trim().slice(0, 120) || 'income * 0.25';
+  return { expenseCategories, expenseBudgets, expenseBudgetsByYear, assetAccounts, taxFormula };
 }
 
 app.get('/api/finance/annotations', async (_req, res) => {
   try {
     const collection = await financeCollection();
     const saved = await collection.findOne({ _id: 'personal-finance-2026' }, { projection: { annotations: 1 } });
-    res.json({ annotations: saved?.annotations || { expenseCategories: {}, expenseBudgets: {} } });
+    res.json({ annotations: saved?.annotations || { expenseCategories: {}, expenseBudgets: {}, expenseBudgetsByYear: {}, assetAccounts: {}, taxFormula: 'income * 0.25' } });
   } catch (error) { sendError(res, error); }
 });
 
@@ -304,8 +370,17 @@ async function networkCollection() {
 app.get('/api/network/graph', async (_req, res) => {
   try {
     const collection = await networkCollection();
-    const saved = await collection.findOne({ _id: 'personal-network-v1' }, { projection: { graph: 1 } });
-    res.json({ graph: saved?.graph || DEFAULT_NETWORK_GRAPH });
+    const saved = await collection.findOne({ _id: 'personal-network-v1' }, { projection: { graph: 1, seedVersion: 1 } });
+    let graph = saved?.graph || DEFAULT_NETWORK_GRAPH;
+    if ((saved?.seedVersion || 0) < NETWORK_SEED_VERSION) {
+      graph = mergeNetworkSeed(graph, NETWORK_EXPANSION);
+      await collection.updateOne(
+        { _id: 'personal-network-v1' },
+        { $set: { graph, seedVersion: NETWORK_SEED_VERSION, updatedAt: new Date() } },
+        { upsert: true }
+      );
+    }
+    res.json({ graph });
   } catch (error) { sendError(res, error); }
 });
 
@@ -315,7 +390,7 @@ app.put('/api/network/graph', async (req, res) => {
     const collection = await networkCollection();
     await collection.updateOne(
       { _id: 'personal-network-v1' },
-      { $set: { graph, updatedAt: new Date() } },
+      { $set: { graph, seedVersion: NETWORK_SEED_VERSION, updatedAt: new Date() } },
       { upsert: true }
     );
     res.json({ ok: true, updatedAt: new Date().toISOString() });
@@ -634,7 +709,7 @@ function financeDatabaseSummary({ database, source, schema }) {
   const properties = schema.properties || {};
   return {
     databaseId: database.id,
-    databaseTitle: (database.title || []).map(part => part.plain_text).join('') || '2026 Finance',
+    databaseTitle: (database.title || []).map(part => part.plain_text).join('') || 'Master transactions',
     dataSourceId: source?.id || null,
     propertyCount: Object.keys(properties).length,
     properties: Object.entries(properties).map(([name, property]) => ({
@@ -662,7 +737,7 @@ app.get('/api/notion/finance/pages', async (req, res) => {
   if (!databaseId) return res.status(400).json({ error: 'A valid Notion database ID is required.' });
   try {
     const resolved = await resolveFinanceDatabase(databaseId, viewId);
-    if (!resolved.source?.id) return res.status(422).json({ error: 'No accessible data source was found in the 2026 finance database.' });
+    if (!resolved.source?.id) return res.status(422).json({ error: 'No accessible data source was found in the selected finance database.' });
     const sortableProperty = Object.entries(resolved.schema.properties || {}).find(([, property]) => property.type === 'date')?.[0]
       || Object.entries(resolved.schema.properties || {}).find(([, property]) => property.type === 'title')?.[0];
     const results = [];

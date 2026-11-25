@@ -10,8 +10,9 @@ import {
 import './style.css';
 
 const DAY_MS = 86400000;
-const FINANCE_DATABASE_ID = '2ee37c615d338118a78be3164e57c360';
-const FINANCE_VIEW_ID = '2ee37c615d3381ac828f000c817ea903';
+const FINANCE_DATABASE_ID = '42337c615d338078bc0edfda9928e42e';
+const FINANCE_VIEW_ID = '42337c615d33800ea957000cd53fe7a4';
+const FINANCE_YEARS = [2026,2025,2024,2023,2022];
 const HABITS = [
   { label: 'No J.O.', aliases: ['no j.o', 'no jo', 'jo', 'no junk food'], icon: UserRound },
   { label: 'No E.N.T.', aliases: ['no e.n.t', 'no ent', 'ent'], icon: Tv },
@@ -23,7 +24,7 @@ const HABITS = [
   { label: 'Hard conversations', aliases: ['hard conversations', 'hard conversation', 'hard convo', 'hard convos'], icon: MessagesSquare },
 ];
 const ASSET_BUCKETS = [
-  { key:'checking', label:'Checking', color:'#4f8a69' },
+  { key:'checking', label:'Cash', color:'#4f8a69' },
   { key:'stocks', label:'Stocks', color:'#5978d6' },
   { key:'bitcoin', label:'Bitcoin', color:'#e1a343' },
   { key:'ethereum', label:'ETH', color:'#8268c5' },
@@ -31,8 +32,10 @@ const ASSET_BUCKETS = [
   { key:'inventory', label:'Inventory', color:'#d27a5e' },
   { key:'owed', label:'Owed to me', color:'#b9698d' },
   { key:'giftCards', label:'Gift cards', color:'#b1984b' },
+  { key:'savings', label:'Savings', color:'#547a9d' },
   { key:'taxes', label:'Taxes', color:'#818d63' },
 ];
+const DEFAULT_TAX_FORMULA = 'income * 0.25';
 const CREDIT_BUCKETS = [
   { key:'rbcMastercard', label:'RBC Mastercard' },
   { key:'rbcCardTwo', label:'Other RBC card' },
@@ -134,6 +137,31 @@ const formatShortDate = value => {
 };
 const money = value => new Intl.NumberFormat('en-CA',{style:'currency',currency:'CAD',maximumFractionDigits:2}).format(Number(value)||0);
 const inputNumber = value => Number.parseFloat(value) || 0;
+function parseFinanceAmount(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  const source=String(value??'').trim();
+  if (!source) return 0;
+  const negative=source.startsWith('-')||(/^\(.*\)$/.test(source));
+  const numeric=source.replace(/,/g,'').replace(/[^\d.]/g,'');
+  const parsed=Number(numeric);
+  return Number.isFinite(parsed)?(negative?-parsed:parsed):0;
+}
+function evaluateTaxFormula(formula,income) {
+  const source=String(formula||'').toLowerCase().replace(/\s+/g,'');
+  const tokens=source.match(/income|\d+(?:\.\d+)?|[()+*/-]/g)||[];
+  if(!source||tokens.join('')!==source)return {value:0,valid:false};
+  let index=0;
+  const primary=()=>{
+    const token=tokens[index++];
+    if(token==='income')return income;
+    if(token==='('){const value=expression();if(tokens[index++]!==')')throw new Error('Missing closing parenthesis');return value;}
+    if(token==='+'||token==='-'){const value=primary();return token==='-'?-value:value;}
+    const value=Number(token);if(!Number.isFinite(value))throw new Error('Expected income, a number, or parentheses');return value;
+  };
+  const term=()=>{let value=primary();while(tokens[index]==='*'||tokens[index]==='/'){const operator=tokens[index++],right=primary();if(operator==='/'&&right===0)throw new Error('Cannot divide by zero');value=operator==='*'?value*right:value/right;}return value;};
+  const expression=()=>{let value=term();while(tokens[index]==='+'||tokens[index]==='-'){const operator=tokens[index++],right=term();value=operator==='+'?value+right:value-right;}return value;};
+  try{const raw=expression();if(index!==tokens.length||!Number.isFinite(raw))return {value:0,valid:false};return {value:Math.max(0,raw),valid:true};}catch{return {value:0,valid:false};}
+}
 function notionValue(property) {
   if (!property) return null;
   const value = property[property.type];
@@ -147,8 +175,14 @@ function notionValue(property) {
 function FinanceNumberInput({label,value,onChange,placeholder='0'}) {
   return <label className="finance-input-label"><span>{label}</span><span className="finance-input-wrap"><span>$</span><input type="number" min="0" step="0.01" inputMode="decimal" placeholder={placeholder} value={value ?? ''} onChange={event=>onChange(event.target.value)}/></span></label>;
 }
-function MonthlyFinanceTable({title,kind,transactions,budgets={},onBudgetChange}) {
-  const matching = transactions.filter(tx=>tx.kind===kind);
+function FinanceBudgetCell({category,budget,hasBudget,editing,onSave}) {
+  return <td className="finance-budget-cell">{editing?<label className="finance-budget-edit"><span>$</span><input type="number" min="0" step="0.01" aria-label={`Annual budget for ${category}`} placeholder="—" value={budget??''} onChange={event=>onSave(category,event.target.value)}/></label>:<span className="finance-budget-value">{hasBudget?money(budget):'—'}</span>}</td>;
+}
+function MonthlyFinanceTable({title,kind,transactions,expenseBudgetsByYear={},legacyExpenseBudgets={},onBudgetChange}) {
+  const [budgetEditing,setBudgetEditing]=useState(false);
+  const [year,setYear]=useState(2026);
+  const budgets=expenseBudgetsByYear[String(year)]||(year===2026?legacyExpenseBudgets:{});
+  const matching = transactions.filter(tx=>tx.kind===kind&&tx.date?.startsWith(`${year}-`));
   const categoryFor = tx => (kind==='expense'?tx.expense2:tx.category) || tx.category || 'Uncategorized';
   const categories = [...new Set([
     ...matching.map(categoryFor),
@@ -157,7 +191,8 @@ function MonthlyFinanceTable({title,kind,transactions,budgets={},onBudgetChange}
   const monthly = categories.map(category=>{
     const values = Array(12).fill(0);
     for (const tx of matching) {
-      if (categoryFor(tx)===category && tx.monthIndex>=0) values[tx.monthIndex] += Math.abs(tx.amount);
+      const monthIndex=Number(tx.date?.slice(5,7))-1;
+      if (categoryFor(tx)===category && monthIndex>=0&&monthIndex<12) values[monthIndex] += Math.abs(tx.amount);
     }
     const total=values.reduce((sum,value)=>sum+value,0);
     const hasBudget=kind==='expense'&&budgets[category]!==undefined&&String(budgets[category])!=='';
@@ -172,22 +207,22 @@ function MonthlyFinanceTable({title,kind,transactions,budgets={},onBudgetChange}
   const totalMargin=budgetedRows.reduce((sum,row)=>sum+row.margin,0);
   const marginClass=value=>value<0?'negative':value>0?'positive':'zero';
   return <section className="finance-section">
-    <div className="finance-section-title"><div><p className="eyebrow">2026 BY MONTH</p><h2>{title}</h2></div><span className="finance-section-meta">{matching.length} transactions</span></div>
-    <div className="finance-monthly-scroll"><table className="finance-monthly-table"><thead><tr><th>Category</th>{Array.from({length:12},(_,i)=><th key={i}>{new Date(2026,i,1).toLocaleDateString('en-US',{month:'short'})}</th>)}{kind==='expense'&&<th>Budget</th>}<th>Total</th>{kind==='expense'&&<th>Margin</th>}</tr></thead><tbody>
-      {monthly.map(row=><tr key={row.category}><th scope="row">{row.category}</th>{row.values.map((value,index)=><td key={index}>{value?money(value):'—'}</td>)}{kind==='expense'&&<td className="finance-budget-cell"><span>$</span><input type="number" min="0" step="0.01" inputMode="decimal" aria-label={`Annual budget for ${row.category}`} placeholder="0" value={budgets[row.category]??''} onChange={event=>onBudgetChange(row.category,event.target.value)}/></td>}<td className="finance-row-total">{money(row.total)}</td>{kind==='expense'&&<td className={`finance-margin ${row.hasBudget?marginClass(row.margin):'unset'}`}>{row.hasBudget?money(row.margin):'—'}</td>}</tr>)}
+    <div className="finance-section-title"><div><p className="eyebrow">{year} BY MONTH</p><h2>{title}</h2></div><div className="finance-monthly-controls"><span className="finance-section-meta">{matching.length} transactions</span><label className="monthly-year-filter"><span>Year</span><select value={year} onChange={event=>setYear(Number(event.target.value))}>{FINANCE_YEARS.map(option=><option key={option} value={option}>{option}</option>)}</select></label></div></div>
+    <div className="finance-monthly-scroll"><table className="finance-monthly-table"><colgroup><col className="monthly-category-column"/>{Array.from({length:12},(_,i)=><col key={i} className={kind==='expense'?'monthly-month-column':'monthly-month-column income-month-column'}/>)}{kind==='expense'&&<col className="monthly-budget-column"/>}<col className={kind==='expense'?'monthly-total-column':'monthly-total-column income-total-column'}/>{kind==='expense'&&<col className="monthly-margin-column"/>}</colgroup><thead><tr><th>Category</th>{Array.from({length:12},(_,i)=><th key={i}>{new Date(year,i,1).toLocaleDateString('en-US',{month:'short'})}</th>)}{kind==='expense'&&<th className="monthly-budget-heading"><button type="button" className={budgetEditing?'is-editing':''} aria-pressed={budgetEditing} title={budgetEditing?'Click to finish editing budgets':'Click to edit all budgets'} onClick={()=>setBudgetEditing(value=>!value)}>Budget</button></th>}<th>Total</th>{kind==='expense'&&<th>Margin</th>}</tr></thead><tbody>
+      {monthly.map(row=><tr key={row.category}><th scope="row">{row.category}</th>{row.values.map((value,index)=><td key={index} title={value?money(value):undefined}>{value?money(value):'—'}</td>)}{kind==='expense'&&<FinanceBudgetCell category={row.category} budget={budgets[row.category]} hasBudget={row.hasBudget} editing={budgetEditing} onSave={(category,amount)=>onBudgetChange(year,category,amount)}/>}<td className="finance-row-total" title={row.total?money(row.total):undefined}>{money(row.total)}</td>{kind==='expense'&&<td className={`finance-margin ${row.hasBudget?marginClass(row.margin):'unset'}`} title={row.hasBudget?money(row.margin):undefined}>{row.hasBudget?money(row.margin):'—'}</td>}</tr>)}
       {kind==='expense'&&!!monthly.length&&<tr className="finance-month-total"><th scope="row">Total</th>{monthTotals.map((value,index)=><td key={index}>{value?money(value):'—'}</td>)}<td>{budgetedRows.length?money(totalBudget):'—'}</td><td className="finance-row-total">{money(yearTotal)}</td><td className={`finance-margin ${budgetedRows.length?marginClass(totalMargin):'unset'}`}>{budgetedRows.length?money(totalMargin):'—'}</td></tr>}
-      {!monthly.length && <tr><td colSpan={kind==='expense'?16:14} className="finance-table-empty">No {kind} transactions found for 2026.</td></tr>}
+      {!monthly.length && <tr><td colSpan={kind==='expense'?16:14} className="finance-table-empty">No {kind} transactions found for {year}.</td></tr>}
     </tbody></table></div>
-    {kind==='expense' && <p className="finance-budget-note">Enter an annual budget for each category. Margin = budget minus yearly spending.</p>}
+    {kind==='expense' && <p className="finance-budget-note">Click <b>Budget</b> to edit the full column; click it again to finish. Margin = budget minus yearly spending.</p>}
   </section>;
 }
-function FinancePage({database,transactions,loading,error,onRetry,inputs,onInput,storageStatus,storageError,annotations,annotationStatus,annotationError,onExpenseCategory,onExpenseBudget}) {
-  const assets = ASSET_BUCKETS.map(bucket=>({...bucket,amount:inputNumber(inputs[`asset:${bucket.key}`])}));
-  const netWorth = assets.reduce((sum,item)=>sum+item.amount,0);
-  let cursor = 0;
-  const chart = netWorth ? `conic-gradient(${assets.map(item=>{
-    const from=cursor; cursor += item.amount/netWorth*100; return `${item.color} ${from}% ${cursor}%`;
-  }).join(',')})` : 'conic-gradient(#e9ece8 0% 100%)';
+function FinancePage({database,transactions,loading,error,onRetry,inputs,onInput,storageStatus,storageError,annotations,annotationStatus,annotationError,onExpenseCategory,onExpenseBudget,onAssetAccounts,onTaxFormula}) {
+  const [activeAssetKey,setActiveAssetKey]=useState('');
+  const [accountDraft,setAccountDraft]=useState([]);
+  const [taxFormulaDraft,setTaxFormulaDraft]=useState(DEFAULT_TAX_FORMULA);
+  const [transactionYear,setTransactionYear]=useState('all');
+  const [transactionType,setTransactionType]=useState('all');
+  const [transactionPage,setTransactionPage]=useState(0);
   const credit = CREDIT_BUCKETS.map(item=>({...item,amount:inputNumber(inputs[`credit:${item.key}`])}));
   const creditTotal = credit.reduce((sum,item)=>sum+item.amount,0);
   const propertyNames = database?.properties?.map(property=>property.name) || [];
@@ -207,17 +242,44 @@ function FinancePage({database,transactions,loading,error,onRetry,inputs,onInput
     const kind=lowerType.includes('income') ? 'income' : lowerType.includes('expense') ? 'expense' : 'other';
     const category=String(read(categoryProperty)||'Uncategorized');
     const expense2=annotations?.expenseCategories?.[page.id]??category;
-    return {id:page.id,item:String(read(itemProperty) || 'Untitled'),date,type,category,expense2,amount:Number(read(amountProperty)||0),kind,monthIndex:date.startsWith('2026-')?Number(date.slice(5,7))-1:-1};
-  }).filter(tx=>tx.date.startsWith('2026-')).sort((a,b)=>b.date.localeCompare(a.date));
+    return {id:page.id,item:String(read(itemProperty) || 'Untitled'),date,type,category,expense2,amount:parseFinanceAmount(read(amountProperty)),kind,monthIndex:date.startsWith('2026-')?Number(date.slice(5,7))-1:-1};
+  }).sort((a,b)=>b.date.localeCompare(a.date));
+  const yearTransactionRows=transactionRows.filter(tx=>tx.date.startsWith('2026-'));
+  const totalIncome=yearTransactionRows.filter(tx=>tx.kind==='income').reduce((sum,tx)=>sum+Math.abs(tx.amount),0);
+  const taxFormula=annotations?.taxFormula||DEFAULT_TAX_FORMULA;
+  const taxEstimate=evaluateTaxFormula(taxFormula,totalIncome);
+  const assets = ASSET_BUCKETS.map(bucket=>({...bucket,amount:bucket.key==='taxes'?taxEstimate.value:bucket.key==='savings'&&inputs[`asset:${bucket.key}`]===undefined?25:inputNumber(inputs[`asset:${bucket.key}`])}));
+  const netWorth = assets.reduce((sum,item)=>sum+item.amount,0);
+  let cursor = 0;
+  const chart = netWorth ? `conic-gradient(${assets.map(item=>{
+    const from=cursor; cursor += item.amount/netWorth*100; return `${item.color} ${from}% ${cursor}%`;
+  }).join(',')})` : 'conic-gradient(#e9ece8 0% 100%)';
   const expense2Options=[...new Set([...(categorySchema?.options||[]),...transactionRows.filter(tx=>tx.kind==='expense').map(tx=>tx.expense2).filter(Boolean)])].sort((a,b)=>a.localeCompare(b));
+  const filteredTransactions=transactionRows.filter(tx=>(transactionYear==='all'||tx.date.startsWith(`${transactionYear}-`))&&(transactionType==='all'||tx.kind===transactionType));
+  const transactionPageCount=Math.max(1,Math.ceil(filteredTransactions.length/100));
+  const safeTransactionPage=Math.min(transactionPage,transactionPageCount-1);
+  const visibleTransactions=filteredTransactions.slice(safeTransactionPage*100,(safeTransactionPage+1)*100);
   const assetShare = assets.map(item=>({...item,percent:netWorth?item.amount/netWorth*100:0}));
+  const openAssetDetails=bucket=>{
+    setActiveAssetKey(bucket.key);
+    if(bucket.key==='taxes'){setTaxFormulaDraft(taxFormula);return;}
+    const savedAccounts=annotations?.assetAccounts?.[bucket.key]||{};
+    const rows=Object.entries(savedAccounts).map(([name,amount])=>({name,amount:String(amount)}));
+    const savedTotal=rows.reduce((sum,row)=>sum+inputNumber(row.amount),0);
+    const currentTotal=assets.find(asset=>asset.key===bucket.key)?.amount||0;
+    if(currentTotal>savedTotal)rows.push({name:'Unallocated',amount:String(currentTotal-savedTotal)});
+    if(!rows.length)rows.push({name:'',amount:''});
+    setAccountDraft(rows);
+  };
+  const activeAsset=ASSET_BUCKETS.find(bucket=>bucket.key===activeAssetKey);
+  const formulaPreview=evaluateTaxFormula(taxFormulaDraft,totalIncome);
   return <main className="finance-dashboard">
     <section className="finance-section net-worth-section">
       <div className="finance-page-heading"><div><p className="eyebrow">PERSONAL FINANCE · 2026</p><h1>Net worth</h1></div><span className="finance-live-status">{database ? `${transactions.length} Notion transactions loaded` : loading ? 'Connecting to Notion…' : 'Notion unavailable'}</span></div>
       <div className={`finance-storage-status ${storageStatus==='error' || storageStatus==='unavailable'?'is-error':''}`} role="status">{storageStatus==='loading'?'Connecting to MongoDB Atlas…':storageStatus==='saving'?'Saving your finance inputs…':storageStatus==='error'||storageStatus==='unavailable'?storageError || 'Finance inputs could not be saved.':storageStatus==='saved'?'Saved to MongoDB Atlas.':'Atlas connected · edits save automatically.'}</div>
       <div className="net-worth-total"><span>Total assets</span><strong>{money(netWorth)}</strong><small>Calculated from the balances below · CAD</small></div>
       <div className="asset-layout">
-        <div className="asset-input-grid">{ASSET_BUCKETS.map(bucket=><FinanceNumberInput key={bucket.key} label={bucket.label} value={inputs[`asset:${bucket.key}`]} onChange={value=>onInput(`asset:${bucket.key}`,value)}/>)}</div>
+        <div className="asset-input-grid">{ASSET_BUCKETS.map(bucket=><div className="asset-input-card" key={bucket.key}>{bucket.key==='taxes'?<div className="tax-asset-value"><span>Taxes estimate</span><strong>{money(taxEstimate.value)}</strong><small>{money(totalIncome)} income × editable formula</small></div>:<FinanceNumberInput label={bucket.label} value={inputs[`asset:${bucket.key}`]??(bucket.key==='savings'?'25':'')} onChange={value=>onInput(`asset:${bucket.key}`,value)}/>}<button type="button" className="asset-details-button" onClick={()=>openAssetDetails(bucket)}>{bucket.key==='taxes'?'Formula & details':'Accounts & breakdown'}</button></div>)}</div>
         <div className="asset-chart-area"><div className="asset-donut" style={{background:chart}}><div><strong>{money(netWorth)}</strong><span>Total assets</span></div></div><div className="asset-legend">{assetShare.map(item=><div className="asset-legend-item" key={item.key}><span className="asset-swatch" style={{background:item.color}}/><span>{item.label}</span><b>{item.percent.toFixed(1)}%</b></div>)}</div></div>
       </div>
     </section>
@@ -229,16 +291,21 @@ function FinancePage({database,transactions,loading,error,onRetry,inputs,onInput
     </section>
 
     <section className="finance-section transactions-section">
-      <div className="finance-section-title"><div><p className="eyebrow">NOTION TABLE</p><h2><span className="finance-year-highlight">2026</span> Transactions</h2></div><span className="finance-section-meta">{loading?'Loading…':`Most recent first · ${transactionRows.length} rows`}</span></div>
+      <div className="finance-section-title transactions-title"><div><p className="eyebrow">MASTER TABLE · 2022–2026</p><h2>{database?.databaseTitle||'Master transactions'}</h2></div><div className="transaction-view-controls">
+        <label className="transaction-year-filter"><span>Year</span><select value={transactionYear} onChange={event=>{setTransactionYear(event.target.value);setTransactionPage(0);}}><option value="all">All years</option>{FINANCE_YEARS.map(year=><option key={year} value={String(year)}>{year}</option>)}</select></label>
+        <div className="transaction-type-filter" role="group" aria-label="Filter transaction type"><span>Type</span><div className="transaction-view-segmented">{[['all','All transactions'],['expense','Expenses'],['income','Income']].map(([value,label])=><button type="button" key={value} className={transactionType===value?'active':''} aria-pressed={transactionType===value} onClick={()=>{setTransactionType(value);setTransactionPage(0);}}>{label}</button>)}</div></div>
+        <span className="transaction-view-count">{loading?'Loading…':`${filteredTransactions.length} items`}</span>
+      </div></div>
       {error && <div className="finance-error"><b>Notion connection issue</b><span>{error}</span><button onClick={onRetry}>Try again</button></div>}
-      <div className={`finance-annotation-status ${annotationStatus==='error'?'is-error':''}`} role="status">{annotationStatus==='loading'?'Loading saved categories…':annotationStatus==='saving'?'Saving categories and budgets…':annotationStatus==='saved'?'Categories and budgets saved to Atlas.':annotationStatus==='error'?`Could not save category edits: ${annotationError||'check MongoDB Atlas connection.'}`:'Expense 2 categories and annual budgets save automatically.'}</div>
-      <div className="finance-transaction-scroll" aria-label="2026 transactions, newest to oldest" tabIndex={0}><table className="finance-transactions"><thead><tr><th>Item</th><th>Amount</th><th>Date</th><th>Type</th><th>Expense / income category</th><th>Expense 2</th></tr></thead><tbody>
-        {transactionRows.map(tx=><tr key={tx.id}><td>{tx.item}</td><td className={tx.kind==='income'?'income-amount':tx.kind==='expense'?'expense-amount':''}>{money(tx.amount)}</td><td>{tx.date || '—'}</td><td><span className={`transaction-kind ${tx.kind}`}>{tx.type || '—'}</span></td><td>{tx.category}</td><td>{tx.kind==='expense'?<select className="finance-category-select" aria-label={`Expense 2 category for ${tx.item}`} value={tx.expense2} disabled={annotationStatus==='loading'} onChange={event=>onExpenseCategory(tx.id,event.target.value)}>{!expense2Options.includes(tx.expense2)&&<option value={tx.expense2}>{tx.expense2}</option>}{expense2Options.map(option=><option key={option} value={option}>{option}</option>)}</select>:<span className="finance-secondary-category-empty">—</span>}</td></tr>)}
-        {!transactionRows.length && <tr><td colSpan={6} className="finance-table-empty">{loading?'Loading transactions…':'No 2026 transaction rows found.'}</td></tr>}
+      <div className={`finance-annotation-status ${annotationStatus==='error'?'is-error':''}`} role="status">{annotationStatus==='loading'?'Loading saved categories…':annotationStatus==='saving'?'Saving categories, budgets, and asset details…':annotationStatus==='saved'?'Finance categories and asset details saved to Atlas.':annotationStatus==='error'?`Could not save finance edits: ${annotationError||'check MongoDB Atlas connection.'}`:'Categories, budgets, account breakdowns, and tax formula save automatically.'}</div>
+      <div className="finance-transaction-scroll" aria-label="Master transactions, newest to oldest" tabIndex={0}><table className="finance-transactions"><thead><tr><th>Item</th><th>Amount</th><th>Date</th><th>Type</th><th>Expense / income category</th><th>Expense 2</th></tr></thead><tbody>
+        {visibleTransactions.map(tx=><tr key={tx.id}><td>{tx.item}</td><td className={tx.kind==='income'?'income-amount':tx.kind==='expense'?'expense-amount':''}>{money(tx.amount)}</td><td>{tx.date || '—'}</td><td><span className={`transaction-kind ${tx.kind}`}>{tx.type || '—'}</span></td><td>{tx.category}</td><td>{tx.kind==='expense'?<select className="finance-category-select" aria-label={`Expense 2 category for ${tx.item}`} value={tx.expense2} disabled={annotationStatus==='loading'} onChange={event=>onExpenseCategory(tx.id,event.target.value)}>{!expense2Options.includes(tx.expense2)&&<option value={tx.expense2}>{tx.expense2}</option>}{expense2Options.map(option=><option key={option} value={option}>{option}</option>)}</select>:<span className="finance-secondary-category-empty">—</span>}</td></tr>)}
+        {!filteredTransactions.length && <tr><td colSpan={6} className="finance-table-empty">{loading?'Loading transactions…':'No transactions match this view.'}</td></tr>}
       </tbody></table></div>
+      <div className="finance-transaction-pagination"><span>Showing {filteredTransactions.length?safeTransactionPage*100+1:0}–{Math.min((safeTransactionPage+1)*100,filteredTransactions.length)} of {filteredTransactions.length}</span><div><button type="button" disabled={safeTransactionPage===0} onClick={()=>setTransactionPage(page=>Math.max(0,page-1))}>Newer 100</button><button type="button" disabled={safeTransactionPage>=transactionPageCount-1} onClick={()=>setTransactionPage(page=>Math.min(transactionPageCount-1,page+1))}>Older 100</button></div></div>
     </section>
 
-    <MonthlyFinanceTable title="Expenses by month" kind="expense" transactions={transactionRows} budgets={annotations?.expenseBudgets||{}} onBudgetChange={onExpenseBudget}/>
+    <MonthlyFinanceTable title="Expenses by month" kind="expense" transactions={transactionRows} expenseBudgetsByYear={annotations?.expenseBudgetsByYear||{}} legacyExpenseBudgets={annotations?.expenseBudgets||{}} onBudgetChange={onExpenseBudget}/>
     <MonthlyFinanceTable title="Income by month" kind="income" transactions={transactionRows}/>
 
     <section className="finance-section retirement-section">
@@ -251,6 +318,10 @@ function FinancePage({database,transactions,loading,error,onRetry,inputs,onInput
         return <article className="retirement-card" key={account}><h3>{account}</h3><div className="retirement-inputs"><FinanceNumberInput label="Annual limit" value={inputs[`limit:${account}`]} onChange={value=>onInput(`limit:${account}`,value)}/><FinanceNumberInput label="Used" value={inputs[`contribution:${account}`]} onChange={value=>onInput(`contribution:${account}`,value)}/></div><div className="retirement-track"><span style={{width:`${percent}%`}}/></div><div className="retirement-summary"><span>{limit?`${percent.toFixed(1)}% used`:'Add a limit to see progress'}</span><b>{money(remaining)} remaining</b></div></article>;
       })}</div>
     </section>
+    {activeAsset&&<div className="finance-modal-backdrop" onMouseDown={event=>{if(event.target===event.currentTarget)setActiveAssetKey('');}}><section className="finance-modal" role="dialog" aria-modal="true" aria-labelledby="finance-modal-title">
+      <div className="finance-modal-heading"><div><p className="eyebrow">ASSET DETAILS</p><h2 id="finance-modal-title">{activeAsset.label}</h2></div><button type="button" className="finance-modal-close" onClick={()=>setActiveAssetKey('')} aria-label="Close">×</button></div>
+      {activeAsset.key==='taxes'?<div className="tax-formula-editor"><p>Estimated 2026 income: <b>{money(totalIncome)}</b></p><label className="network-field"><span>Tax estimate formula</span><input value={taxFormulaDraft} onChange={event=>setTaxFormulaDraft(event.target.value)} placeholder="income * 0.25"/></label><small>Use <code>income</code>, numbers, +, −, ×, ÷, and parentheses. Example: <code>income * 0.25</code></small>{formulaPreview.valid?<div className="tax-formula-preview">{taxFormulaDraft} = <b>{money(formulaPreview.value)}</b></div>:<div className="tax-formula-error">Formula not understood. Check the expression and try again.</div>}<button type="button" className="network-primary-button" disabled={!formulaPreview.valid} onClick={()=>{onTaxFormula(taxFormulaDraft);setActiveAssetKey('');}}>Save formula</button></div>:<><p className="finance-modal-description">Add the accounts, wallets, or platforms holding this asset. Their balances will add up to the amount shown in the chart.</p><div className="asset-account-rows">{accountDraft.map((row,index)=><div className="asset-account-row" key={index}><input aria-label="Account or platform name" maxLength={100} placeholder="e.g. RBC, PayPal, Wealthsimple" value={row.name} onChange={event=>setAccountDraft(current=>current.map((item,i)=>i===index?{...item,name:event.target.value}:item))}/><label><span>$</span><input aria-label="Balance" type="number" min="0" step="0.01" value={row.amount} onChange={event=>setAccountDraft(current=>current.map((item,i)=>i===index?{...item,amount:event.target.value}:item))}/></label><button type="button" className="account-remove-button" onClick={()=>setAccountDraft(current=>current.filter((_,i)=>i!==index))} aria-label="Remove account">×</button></div>)}</div><button type="button" className="asset-add-account" onClick={()=>setAccountDraft(current=>[...current,{name:'',amount:''}])}>+ Add account</button><div className="finance-modal-actions"><button type="button" className="network-primary-button" onClick={()=>{const accounts=Object.fromEntries(accountDraft.map(row=>[row.name.trim(),row.amount.trim()]).filter(([name])=>name));const total=Object.values(accounts).reduce((sum,value)=>sum+inputNumber(value),0);onAssetAccounts(activeAsset.key,accounts);onInput(`asset:${activeAsset.key}`,String(total));setActiveAssetKey('');}}>Save breakdown</button><button type="button" className="finance-modal-cancel" onClick={()=>setActiveAssetKey('')}>Cancel</button></div></>}
+    </section></div>}
   </main>;
 }
 const STRENGTH_LABELS = ['1 · Cold','2 · Email/social reply','3 · Text reply','4 · Call','5 · In person'];
@@ -265,7 +336,7 @@ function findNetworkPaths(graph, targetId) {
       paths.push({nodes:nodePath.map(id=>nodesById.get(id)).filter(Boolean),edges:edgePath,potential});
       return;
     }
-    if (nodePath.length>=9 || paths.length>=20) return;
+    if (nodePath.length>=12 || paths.length>=100) return;
     for (const edge of outgoing.get(nodeId)||[]) {
       if (seen.has(edge.to)) continue;
       const nextSeen=new Set(seen); nextSeen.add(edge.to);
@@ -276,9 +347,18 @@ function findNetworkPaths(graph, targetId) {
   return paths;
 }
 function NetworkNodePill({node}) {
-  return <div className={`network-node-pill ${node.type}`}><span className="network-node-icon">{node.type==='organization'?<Building2 size={15}/>:<UserRound size={15}/>}</span><b>{node.name}</b>{node.type==='person'&&node.id!=='you'&&<span className="network-level-badge">{node.strength?`L${node.strength}`:'Unrated'}</span>}</div>;
+  if(!node)return null;
+  const instagram=node.instagram?.trim()?(node.instagram.startsWith('http')?node.instagram:`https://instagram.com/${node.instagram.replace(/^@/,'')}`):'';
+  const strengthClass=node.strength?` level-${node.strength}`:'';
+  const roleIcon={artist:'♫',producer:'♫',executive:'✦',manager:'↗',media:'▣',organization:'▦',other:'•'}[node.role]||'•';
+  return <div className={`network-node-pill ${node.type}${strengthClass}`}>
+    {node.imageUrl?<img className="network-node-photo" src={node.imageUrl} alt="" loading="lazy"/>:<span className="network-node-icon" aria-hidden="true">{node.id==='you'?<UserRound size={15}/>:roleIcon}</span>}
+    <span className="network-node-copy"><b>{node.name}</b><small>{node.role&&node.role!=='other'?node.role:node.type}{node.city?` · ${node.city}`:''}</small>
+      {(instagram||node.email||node.phone)&&<span className="network-node-contacts">{instagram&&<a href={instagram} target="_blank" rel="noreferrer" onClick={event=>event.stopPropagation()}>Instagram</a>}{node.email&&<a href={`mailto:${node.email}`} onClick={event=>event.stopPropagation()}>Email</a>}{node.phone&&<a href={`tel:${node.phone}`} onClick={event=>event.stopPropagation()}>Phone</a>}</span>}
+    </span>{node.type==='person'&&node.id!=='you'&&<span className="network-level-badge">{node.strength?`L${node.strength}`:'Unrated'}</span>}
+  </div>;
 }
-function NetworkPage({graph,loading,error,onRetry,onAddNode,onAddEdge,onStrengthChange,saveStatus}) {
+function NetworkPage({graph,loading,error,onRetry,onAddNode,onAddEdge,onStrengthChange,onUpdateNode,saveStatus}) {
   const [targetId,setTargetId]=useState('la-leakers');
   const [newName,setNewName]=useState('');
   const [newType,setNewType]=useState('person');
@@ -286,16 +366,19 @@ function NetworkPage({graph,loading,error,onRetry,onAddNode,onAddEdge,onStrength
   const [edgeTo,setEdgeTo]=useState('');
   const [edgeLabel,setEdgeLabel]=useState('');
   const [edgeStatus,setEdgeStatus]=useState('confirmed');
+  const [profileId,setProfileId]=useState('you');
   const nodes=graph?.nodes||[];
   const people=nodes.filter(node=>node.id!=='you'&&node.type==='person');
   const paths=useMemo(()=>findNetworkPaths(graph,targetId),[graph,targetId]);
   const youNode=nodes.find(node=>node.id==='you');
   const selectedTarget=nodes.find(node=>node.id===targetId);
+  const profileNode=nodes.find(node=>node.id===profileId);
   useEffect(()=>{
     if(nodes.length&&!nodes.some(node=>node.id===targetId)) setTargetId(nodes.find(node=>node.id!=='you')?.id||'');
     if(nodes.length&&!nodes.some(node=>node.id===edgeFrom)) setEdgeFrom('you');
     if(nodes.length&&!nodes.some(node=>node.id===edgeTo)) setEdgeTo(nodes.find(node=>node.id!=='you')?.id||'');
-  },[nodes,targetId,edgeFrom,edgeTo]);
+    if(nodes.length&&!nodes.some(node=>node.id===profileId)) setProfileId('you');
+  },[nodes,targetId,edgeFrom,edgeTo,profileId]);
   const addNode=event=>{
     event.preventDefault();
     const name=newName.trim(); if(!name)return;
@@ -319,19 +402,18 @@ function NetworkPage({graph,loading,error,onRetry,onAddNode,onAddEdge,onStrength
 
     <section className="network-map-card">
       <div className="network-map-heading"><div><p className="eyebrow">CONNECTION PATHS</p><h2>{selectedTarget?`How you connect to ${selectedTarget.name}`:'Choose a connection'}</h2></div><label className="network-target-picker"><span>Explore</span><select value={targetId} onChange={event=>setTargetId(event.target.value)} disabled={!nodes.length}>{nodes.filter(node=>node.id!=='you').map(node=><option key={node.id} value={node.id}>{node.name}</option>)}</select></label></div>
-      {loading&&!graph?<div className="network-empty">Loading your connection graph…</div>:!paths.length?<div className="network-empty"><NetworkIcon size={22}/><span>No confirmed route yet. Add people and relationship details below to build one.</span></div>:<div className="network-tree-scroll"><div className="network-converging-tree" style={{gridTemplateRows:`repeat(${paths.length}, minmax(78px, auto))`}}>
-        <div className="network-converging-endpoint source" style={{gridRow:`1 / span ${paths.length}`}}><NetworkNodePill node={youNode}/></div>
-        {paths.map((path,index)=>{
-          const intermediates=path.nodes.slice(1,-1);
-          return <div className={`network-converging-route ${path.potential?'potential':''}`} style={{gridRow:index+1}} key={path.edges.map(edge=>edge.id).join(':')||targetId}>
+      {loading&&!graph?<div className="network-empty">Loading your connection graph…</div>:!paths.length?<div className="network-empty"><NetworkIcon size={22}/><span>No route yet. Add people and relationship details below to build one.</span></div>:<div className="network-tree-scroll"><div className="network-vertical-tree">
+        <div className="network-tree-target"><NetworkNodePill node={selectedTarget}/></div>
+        <div className="network-vertical-branches">{paths.map((path,index)=>{
+          const intermediates=path.nodes.slice(1,-1).reverse();
+          const reversedEdges=[...path.edges].reverse();
+          return <div className={`network-vertical-branch ${path.potential?'potential':''}`} key={path.edges.map(edge=>edge.id).join(':')||targetId}>
             <span className="network-route-number">{path.potential?'Potential':'Path'} {index+1}</span>
-            {intermediates.length?intermediates.map((node,nodeIndex)=><React.Fragment key={`${node.id}-${nodeIndex}`}>
-              <div className="network-route-step"><small className={path.edges[nodeIndex]?.status==='potential'?'potential':''}>{path.edges[nodeIndex]?.label}</small><NetworkNodePill node={node}/></div><span className="network-flow-arrow" aria-hidden="true">→</span>
-            </React.Fragment>):<small className={`network-route-direct-label ${path.edges[0]?.status==='potential'?'potential':''}`}>{path.edges[0]?.label||'Direct connection'}</small>}
-            {intermediates.length>0&&<small className={`network-route-target-label ${path.edges.at(-1)?.status==='potential'?'potential':''}`}>{path.edges.at(-1)?.label}</small>}
+            {intermediates.map((node,nodeIndex)=><React.Fragment key={`${node.id}-${nodeIndex}`}><div className={`network-vertical-link-label ${reversedEdges[nodeIndex]?.status==='potential'?'potential':''}`}>{reversedEdges[nodeIndex]?.label}</div><span className="network-vertical-arrow" aria-hidden="true">↓</span><NetworkNodePill node={node}/></React.Fragment>)}
+            <div className={`network-vertical-link-label to-you ${reversedEdges.at(-1)?.status==='potential'?'potential':''}`}>{reversedEdges.at(-1)?.label||'Direct connection'}</div>
           </div>;
-        })}
-        <div className="network-converging-endpoint target" style={{gridRow:`1 / span ${paths.length}`}}><NetworkNodePill node={selectedTarget}/></div>
+        })}</div>
+        <div className="network-tree-you"><NetworkNodePill node={youNode}/></div>
       </div></div>}
       {!!paths.length&&<div className="network-path-count"><GitBranch size={13}/>{paths.length} {paths.length===1?'route':'routes'} shown in one tree{paths.some(path=>path.potential)&&<span> · potential branches included</span>}</div>}
       <p className="network-map-note">The map starts at one You node and merges every route at one target. Strength rates your direct relationship with a person; unrated contacts stay blank until you set them.</p>
@@ -351,6 +433,18 @@ function NetworkPage({graph,loading,error,onRetry,onAddNode,onAddEdge,onStrength
         <label className="network-field"><span>How are they connected?</span><input maxLength={240} value={edgeLabel} onChange={event=>setEdgeLabel(event.target.value)} placeholder="e.g. manages, collaborated with" required/></label>
         <label className="network-field"><span>Path status</span><select value={edgeStatus} onChange={event=>setEdgeStatus(event.target.value)}><option value="confirmed">Known connection</option><option value="potential">Potential lead</option></select></label>
         <button className="network-primary-button" type="submit" disabled={!edgeFrom||!edgeTo||edgeFrom===edgeTo||!edgeLabel.trim()}>Add relationship</button>
+      </form>
+      <form className="network-editor-card network-profile-editor" onSubmit={event=>event.preventDefault()}>
+        <div className="network-editor-heading"><span className="network-editor-icon"><UserRound size={15}/></span><div><h2>Contact profile</h2><p>Add role, photo, city, and contact details for a connection.</p></div></div>
+        <label className="network-field"><span>Person or organization</span><select value={profileId} onChange={event=>setProfileId(event.target.value)}>{nodes.map(node=><option key={node.id} value={node.id}>{node.name}</option>)}</select></label>
+        {profileNode&&<>
+          <label className="network-field"><span>Role / type</span><select value={profileNode.role||'other'} onChange={event=>onUpdateNode(profileId,{role:event.target.value})}>{['artist','producer','executive','manager','media','organization','other'].map(role=><option key={role} value={role}>{role[0].toUpperCase()+role.slice(1)}</option>)}</select></label>
+          <label className="network-field"><span>City</span><input maxLength={100} value={profileNode.city||''} onChange={event=>onUpdateNode(profileId,{city:event.target.value})} placeholder="City"/></label>
+          <label className="network-field"><span>Instagram link or handle</span><input maxLength={240} value={profileNode.instagram||''} onChange={event=>onUpdateNode(profileId,{instagram:event.target.value})} placeholder="@handle or instagram.com/..."/></label>
+          <label className="network-field"><span>Email</span><input type="email" maxLength={254} value={profileNode.email||''} onChange={event=>onUpdateNode(profileId,{email:event.target.value})} placeholder="name@example.com"/></label>
+          <label className="network-field"><span>Phone</span><input type="tel" maxLength={60} value={profileNode.phone||''} onChange={event=>onUpdateNode(profileId,{phone:event.target.value})} placeholder="Phone number"/></label>
+          <label className="network-field"><span>Photo URL (https)</span><input type="url" maxLength={1000} value={profileNode.imageUrl||''} onChange={event=>onUpdateNode(profileId,{imageUrl:event.target.value})} placeholder="Paste an image URL"/></label>
+        </>}
       </form>
     </section>
 
@@ -392,7 +486,7 @@ function App() {
   const [financeStorageError, setFinanceStorageError] = useState('');
   const [financeDirty, setFinanceDirty] = useState(false);
   const financeEditSequence = useRef(0);
-  const [financeAnnotations, setFinanceAnnotations] = useState({expenseCategories:{},expenseBudgets:{}});
+  const [financeAnnotations, setFinanceAnnotations] = useState({expenseCategories:{},expenseBudgets:{},expenseBudgetsByYear:{},assetAccounts:{},taxFormula:DEFAULT_TAX_FORMULA});
   const [financeAnnotationStatus, setFinanceAnnotationStatus] = useState('loading');
   const [financeAnnotationError, setFinanceAnnotationError] = useState('');
   const [financeAnnotationsDirty, setFinanceAnnotationsDirty] = useState(false);
@@ -447,7 +541,7 @@ function App() {
         setFinanceAnnotationStatus('error');
         setFinanceAnnotationError(savedAnnotations.storageError);
       } else {
-        if (financeAnnotationSequence.current===annotationSequenceAtLoad) setFinanceAnnotations(savedAnnotations.annotations||{expenseCategories:{},expenseBudgets:{}});
+        if (financeAnnotationSequence.current===annotationSequenceAtLoad) setFinanceAnnotations(savedAnnotations.annotations||{expenseCategories:{},expenseBudgets:{},expenseBudgetsByYear:{},assetAccounts:{},taxFormula:DEFAULT_TAX_FORMULA});
         setFinanceAnnotationStatus('ready');
         setFinanceAnnotationError('');
       }
@@ -474,9 +568,15 @@ function App() {
   const setExpenseCategory = useCallback((pageId,category) => changeFinanceAnnotations(current=>({
     ...current,expenseCategories:{...current.expenseCategories,[pageId]:category}
   })),[changeFinanceAnnotations]);
-  const setExpenseBudget = useCallback((category,amount) => changeFinanceAnnotations(current=>({
-    ...current,expenseBudgets:{...current.expenseBudgets,[category]:amount}
+  const setExpenseBudget = useCallback((year,category,amount) => changeFinanceAnnotations(current=>{
+    const expenseBudgetsByYear=current.expenseBudgetsByYear||{};
+    const yearBudgets=expenseBudgetsByYear[String(year)]||(year===2026?current.expenseBudgets||{}:{});
+    return {...current,expenseBudgetsByYear:{...expenseBudgetsByYear,[String(year)]:{...yearBudgets,[category]:amount}}};
+  }),[changeFinanceAnnotations]);
+  const setAssetAccounts = useCallback((assetKey,accounts) => changeFinanceAnnotations(current=>({
+    ...current,assetAccounts:{...current.assetAccounts,[assetKey]:accounts}
   })),[changeFinanceAnnotations]);
+  const setTaxFormula = useCallback(formula => changeFinanceAnnotations(current=>({...current,taxFormula:formula})),[changeFinanceAnnotations]);
 
   const loadNetworkGraph = useCallback(async () => {
     if (networkBusy) return;
@@ -508,6 +608,9 @@ function App() {
   }, [changeNetworkGraph]);
   const setNetworkStrength = useCallback((nodeId,strength) => {
     changeNetworkGraph(graph => ({...graph,nodes:graph.nodes.map(node=>node.id===nodeId?{...node,strength}:node)}));
+  }, [changeNetworkGraph]);
+  const updateNetworkNode = useCallback((nodeId,updates) => {
+    changeNetworkGraph(graph => ({...graph,nodes:graph.nodes.map(node=>node.id===nodeId?{...node,...updates}:node)}));
   }, [changeNetworkGraph]);
 
   useEffect(() => {
@@ -870,7 +973,7 @@ function App() {
           {database && habitProperties.some(h=>!h.propertyName) && <div className="mapping-note">Not matched in Notion: {habitProperties.filter(h=>!h.propertyName).map(h=>h.label).join(', ')}. Share the exact Notion column names and I’ll map them.</div>}
         </section>
       </section>
-    </main> : activeView==='finance' ? <FinancePage database={financeDatabase} transactions={financeTransactions} loading={financeBusy} error={financeError} onRetry={loadFinanceDatabase} inputs={financeInputs} onInput={setFinanceInput} storageStatus={financeStorageStatus} storageError={financeStorageError} annotations={financeAnnotations} annotationStatus={financeAnnotationStatus} annotationError={financeAnnotationError} onExpenseCategory={setExpenseCategory} onExpenseBudget={setExpenseBudget}/> : <NetworkPage graph={networkGraph} loading={networkBusy} error={networkError} onRetry={loadNetworkGraph} onAddNode={addNetworkNode} onAddEdge={addNetworkEdge} onStrengthChange={setNetworkStrength} saveStatus={networkSaveStatus}/>}
+    </main> : activeView==='finance' ? <FinancePage database={financeDatabase} transactions={financeTransactions} loading={financeBusy} error={financeError} onRetry={loadFinanceDatabase} inputs={financeInputs} onInput={setFinanceInput} storageStatus={financeStorageStatus} storageError={financeStorageError} annotations={financeAnnotations} annotationStatus={financeAnnotationStatus} annotationError={financeAnnotationError} onExpenseCategory={setExpenseCategory} onExpenseBudget={setExpenseBudget} onAssetAccounts={setAssetAccounts} onTaxFormula={setTaxFormula}/> : <NetworkPage graph={networkGraph} loading={networkBusy} error={networkError} onRetry={loadNetworkGraph} onAddNode={addNetworkNode} onAddEdge={addNetworkEdge} onStrengthChange={setNetworkStrength} onUpdateNode={updateNetworkNode} saveStatus={networkSaveStatus}/>}
   </div>;
 }
 
